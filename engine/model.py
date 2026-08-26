@@ -17,6 +17,13 @@ import torch
 import torch.nn.functional as F
 
 from .paged_attention import paged_causal_attention_incremental, write_kv
+from .quantization import QuantizedWeight
+
+Weight = torch.Tensor | QuantizedWeight
+
+
+def _resolve(w: Weight) -> torch.Tensor:
+    return w.get() if isinstance(w, QuantizedWeight) else w
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -51,13 +58,13 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 class LayerWeights:
     input_ln: torch.Tensor
     post_ln: torch.Tensor
-    q_w: torch.Tensor
-    k_w: torch.Tensor
-    v_w: torch.Tensor
-    o_w: torch.Tensor
-    gate_w: torch.Tensor
-    up_w: torch.Tensor
-    down_w: torch.Tensor
+    q_w: Weight
+    k_w: Weight
+    v_w: Weight
+    o_w: Weight
+    gate_w: Weight
+    up_w: Weight
+    down_w: Weight
     q_b: torch.Tensor | None = None
     k_b: torch.Tensor | None = None
     v_b: torch.Tensor | None = None
@@ -67,11 +74,18 @@ class PagedCausalLM:
     """Loads a real HF checkpoint's weights, runs forward passes through our
     own paged-attention implementation instead of HF's model code."""
 
-    def __init__(self, model_id: str, device: str = "cpu", dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        model_id: str,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+        quantize: bool = False,
+    ):
         from transformers import AutoConfig, AutoModelForCausalLM
 
         self.device = device
         self.dtype = dtype
+        self.quantize = quantize
         self.config = AutoConfig.from_pretrained(model_id)
         self.num_heads = self.config.num_attention_heads
         self.num_kv_heads = self.config.num_key_value_heads
@@ -91,19 +105,25 @@ class PagedCausalLM:
         self.final_norm_w = sd["model.norm.weight"].to(device)
         self.lm_head_w = sd.get("lm_head.weight", self.embed_tokens).to(device)
 
+        def load_weight(key: str) -> Weight:
+            w = sd[key]
+            if self.quantize:
+                return QuantizedWeight(w).to(device)
+            return w.to(device)
+
         self.layers: list[LayerWeights] = []
         for i in range(self.config.num_hidden_layers):
             p = f"model.layers.{i}."
             layer = LayerWeights(
                 input_ln=sd[p + "input_layernorm.weight"].to(device),
                 post_ln=sd[p + "post_attention_layernorm.weight"].to(device),
-                q_w=sd[p + "self_attn.q_proj.weight"].to(device),
-                k_w=sd[p + "self_attn.k_proj.weight"].to(device),
-                v_w=sd[p + "self_attn.v_proj.weight"].to(device),
-                o_w=sd[p + "self_attn.o_proj.weight"].to(device),
-                gate_w=sd[p + "mlp.gate_proj.weight"].to(device),
-                up_w=sd[p + "mlp.up_proj.weight"].to(device),
-                down_w=sd[p + "mlp.down_proj.weight"].to(device),
+                q_w=load_weight(p + "self_attn.q_proj.weight"),
+                k_w=load_weight(p + "self_attn.k_proj.weight"),
+                v_w=load_weight(p + "self_attn.v_proj.weight"),
+                o_w=load_weight(p + "self_attn.o_proj.weight"),
+                gate_w=load_weight(p + "mlp.gate_proj.weight"),
+                up_w=load_weight(p + "mlp.up_proj.weight"),
+                down_w=load_weight(p + "mlp.down_proj.weight"),
                 q_b=sd.get(p + "self_attn.q_proj.bias"),
                 k_b=sd.get(p + "self_attn.k_proj.bias"),
                 v_b=sd.get(p + "self_attn.v_proj.bias"),
@@ -145,9 +165,9 @@ class PagedCausalLM:
             residual = x
             h = rms_norm(x, layer.input_ln, self.rms_eps)
 
-            q = F.linear(h, layer.q_w, layer.q_b).view(chunk_len, self.num_heads, self.head_dim)
-            k = F.linear(h, layer.k_w, layer.k_b).view(chunk_len, self.num_kv_heads, self.head_dim)
-            v = F.linear(h, layer.v_w, layer.v_b).view(chunk_len, self.num_kv_heads, self.head_dim)
+            q = F.linear(h, _resolve(layer.q_w), layer.q_b).view(chunk_len, self.num_heads, self.head_dim)
+            k = F.linear(h, _resolve(layer.k_w), layer.k_b).view(chunk_len, self.num_kv_heads, self.head_dim)
+            v = F.linear(h, _resolve(layer.v_w), layer.v_b).view(chunk_len, self.num_kv_heads, self.head_dim)
 
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
@@ -161,13 +181,13 @@ class PagedCausalLM:
                 block_table, self.block_size, start_pos,
             )
             attn_out = attn_out.reshape(chunk_len, self.num_heads * self.head_dim)
-            x = residual + F.linear(attn_out, layer.o_w)
+            x = residual + F.linear(attn_out, _resolve(layer.o_w))
 
             residual = x
             h = rms_norm(x, layer.post_ln, self.rms_eps)
-            gate = F.linear(h, layer.gate_w)
-            up = F.linear(h, layer.up_w)
-            x = residual + F.linear(F.silu(gate) * up, layer.down_w)
+            gate = F.linear(h, _resolve(layer.gate_w))
+            up = F.linear(h, _resolve(layer.up_w))
+            x = residual + F.linear(F.silu(gate) * up, _resolve(layer.down_w))
 
         x = rms_norm(x, self.final_norm_w, self.rms_eps)
         return F.linear(x, self.lm_head_w)

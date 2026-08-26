@@ -21,7 +21,7 @@ gateway) — Inferoute routes to backends; this project *is* a backend.
 - [x] Phase 4 — CUDA graphs: capture/replay mechanism runs correctly on real GPU (T4, Colab); still only proven for a fixed start_pos, not across a real decode loop — see known gaps
 - [x] Phase 5 — one custom Triton kernel (fused RMSNorm) — **verified on real GPU** (T4, Colab): matches `engine.model.rms_norm` to bf16-scale tolerance (max abs diff 0.0039)
 - [x] Phase 6a — prefix caching (radix-style block hashing)
-- [ ] Phase 6b — quantization, tensor parallelism (not started)
+- [x] Phase 6b — INT8 weight-only quantization (`engine/quantization.py`, wired into `PagedCausalLM`) — **verified**: round-trip error bounded, and against the real 0.5B checkpoint on CPU, argmax matches the unquantized model at 5/5 positions. Tensor-parallel primitives (`engine/tensor_parallel.py`, Megatron-style column/row-parallel linear) — **algorithm verified** via 2 real CPU processes over `torch.distributed` (gloo), sharded computation matches single-process reference exactly. Not wired into `PagedCausalLM` itself and never run on multi-GPU — this repo has never had access to two GPUs at once to test that path for real.
 - [x] Phase 7 — OpenAI-compatible streaming API (`/v1/chat/completions`) — **verified live**: `server.py` on a real GPU, hit over a real public URL (Cloudflare tunnel) with `/health`, a non-streaming completion, and a streaming completion, all correct
 - [ ] Phase 8 — benchmark vs real vLLM instance (harness written in `benchmarks/`, no numbers yet — nothing gets filled in without actually running it)
 
@@ -98,10 +98,17 @@ not just written and assumed correct:
   `ponytail:` comment in `server.py`/`app.py` about decoding each new span
   independently instead of keeping a boundary-safe trailing buffer still
   stands.
-- **Phase 8's benchmark still has no numbers.** A live server now exists
-  (ephemeral, Colab-based) — `benchmarks/bench_vs_vllm.py` could be run
-  against it plus a real vLLM instance, but that comparison hasn't
-  happened yet.
+- **Phase 8's benchmark harness now runs both servers on the same free T4**
+  (`pageserve_vs_vllm_benchmark.ipynb`), sequentially (one GPU, so not
+  concurrently) — pending a run. Whatever numbers come out get pasted
+  here verbatim, not summarized into a claim beyond what a single-request,
+  single-GPU comparison can actually show (it mostly tests per-token
+  decode overhead, not the batching-throughput gap called out above,
+  since that gap only shows up under concurrent load).
+- **Tensor parallelism is unwired and untested on real hardware.** The
+  column/row-parallel math is verified correct (2 CPU processes, gloo,
+  exact match to a single-process reference) but `PagedCausalLM` doesn't
+  use it, and nothing here has ever run on more than one GPU.
 
 ## Setup
 
