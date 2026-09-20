@@ -53,10 +53,10 @@ class Scheduler:
             seq.block_table.append(self.allocator.allocate())
         return True
 
-    def _preempt_victim_other_than(self, protected: Sequence) -> bool:
+    def _preempt_victim_other_than(self, protected: list[Sequence]) -> bool:
         for i in range(len(self.running) - 1, -1, -1):
             victim = self.running[i]
-            if victim is protected:
+            if any(victim is p for p in protected):
                 continue
             del self.running[i]
             freed = victim.reset_for_recompute()
@@ -77,6 +77,7 @@ class Scheduler:
     def step(self) -> list[BatchEntry]:
         self._admit()
         batch: list[BatchEntry] = []
+        batched_seqs: list[Sequence] = []
         tokens_used = 0
 
         for seq in list(self.running):
@@ -96,8 +97,13 @@ class Scheduler:
                 chunk = 1
                 projected_total = seq.num_tokens + 1
 
+            # A sequence already appended to `batch` this iteration must
+            # never be picked as a preemption victim by a later sequence's
+            # block request: it would silently null out that already-
+            # returned BatchEntry's block_table out from under the caller.
+            protected = [seq, *batched_seqs]
             ok = self._ensure_blocks(seq, projected_total)
-            while not ok and self._preempt_victim_other_than(seq):
+            while not ok and self._preempt_victim_other_than(protected):
                 ok = self._ensure_blocks(seq, projected_total)
             if not ok:
                 continue  # stalled this iteration; retried next step
@@ -107,6 +113,7 @@ class Scheduler:
             produces_token = not seq.is_prefill_incomplete()
 
             batch.append(BatchEntry(seq=seq, chunk=chunk, produces_token=produces_token))
+            batched_seqs.append(seq)
             tokens_used += chunk
 
         return batch
